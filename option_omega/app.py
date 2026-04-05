@@ -67,6 +67,18 @@ STRIKE_DEFAULTS = {
     "% OTM":         5.0,
 }
 
+CHILD_STRIKE_METHODS = ["Width (pts)", "Delta + Max Width", "Premium + Max Width"]
+CHILD_STRIKE_METHOD_KEY = {
+    "Width (pts)":         "width",
+    "Delta + Max Width":   "delta_maxwidth",
+    "Premium + Max Width": "premium_maxwidth",
+}
+CHILD_STRIKE_CAPTIONS = {
+    "Width (pts)":         "Signed point offset from parent strike.",
+    "Delta + Max Width":   "Find strike nearest target delta, but no farther than Max Width pts from parent.",
+    "Premium + Max Width": "Find strike nearest target premium ($), but no farther than Max Width pts from parent.",
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +130,17 @@ def time_from_str(s: str, default_h: int = 9, default_m: int = 45) -> dtime:
 def load_strategies() -> dict:
     if os.path.exists(SAVE_FILE):
         with open(SAVE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        for sdata in data.values():
+            for leg in sdata.get("legs", []):
+                leg.setdefault("round_strikes", "")
+                if leg.get("parent_id", 0) != 0:
+                    leg.setdefault("child_method", "width")
+                    leg.setdefault("max_width", "0")
+                    leg.setdefault("lock", True)
+                else:
+                    leg.setdefault("lock", False)
+        return data
     return {}
 
 
@@ -178,6 +200,7 @@ def add_parent_leg():
         "dte":           "0",
         "exact_dte":     False,
         "lock":          False,
+        "round_strikes": "",
     })
 
 
@@ -187,14 +210,16 @@ def add_child_leg(parent_id: int):
     st.session_state.legs.append({
         "leg_id":        next_leg_id(),
         "parent_id":     parent_id,
-        "action":        "SELL",
+        "action":        "BUY",
         "right":         "CALL",
         "quantity":      "1",
-        "strike_method": "delta",
-        "strike_val":    "0.20",
+        "child_method":  "width",
+        "strike_val":    "0",
+        "max_width":     "0",
         "dte":           "0",
         "exact_dte":     False,
-        "lock":          False,
+        "lock":          True,
+        "round_strikes": "",
     })
 
 
@@ -212,73 +237,87 @@ def render_leg(leg: dict, is_child: bool = False):
     lid      = leg["leg_id"]
     children = get_child_legs(lid)
     has_room = len(st.session_state.legs) < MAX_LEGS
-
-    if "strike_method" not in leg:
-        leg["strike_method"] = "delta"
-
-    sm_display = next(
-        (k for k, v in STRIKE_METHOD_KEY.items() if v == leg.get("strike_method", "delta")),
-        "Delta"
-    )
-
-    indent_label = ("↳ Child Leg " + str(lid)) if is_child else ("Leg " + str(lid))
-
+    leg.setdefault("round_strikes", "")
+    if is_child:
+        if "child_method" not in leg:
+            old_sm = leg.get("strike_method", "delta")
+            leg["child_method"] = (
+                "delta_maxwidth"   if old_sm == "delta" else
+                "premium_maxwidth" if old_sm == "fixed_premium" else "width")
+        leg.setdefault("max_width", "0")
+        leg.setdefault("lock", True)
+    else:
+        leg.setdefault("strike_method", "delta")
+        leg.setdefault("lock", False)
+    indent_label = ("↳ Linked Leg " + str(lid)) if is_child else ("Leg " + str(lid))
     with st.expander(indent_label, expanded=True):
-        c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1.6, 1.2, 1, 1])
-
-        leg["action"] = c1.selectbox(
-            "Action", ["BUY", "SELL"],
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 0.8, 1.8, 1.2, 1, 0.7])
+        leg["action"] = c1.selectbox("Action", ["BUY", "SELL"],
             index=["BUY", "SELL"].index(leg.get("action", "BUY")),
-            key="leg_action_" + str(lid),
-        )
-        leg["right"] = c2.selectbox(
-            "Right", ["CALL", "PUT"],
+            key="leg_action_" + str(lid))
+        leg["right"] = c2.selectbox("Right", ["CALL", "PUT"],
             index=["CALL", "PUT"].index(leg.get("right", "CALL")),
-            key="leg_right_" + str(lid),
-        )
-        leg["quantity"] = c3.text_input(
-            "Qty", value=leg.get("quantity", "1"),
-            key="leg_qty_" + str(lid),
-        )
-
-        new_sm_label = c4.selectbox(
-            "Strike Method", STRIKE_METHODS,
-            index=STRIKE_METHODS.index(sm_display),
-            key="leg_sm_" + str(lid),
-        )
-        if STRIKE_METHOD_KEY[new_sm_label] != leg["strike_method"]:
-            leg["strike_method"] = STRIKE_METHOD_KEY[new_sm_label]
-            leg["strike_val"]    = str(STRIKE_DEFAULTS[new_sm_label])
-
-        leg["strike_val"] = c5.text_input(
-            STRIKE_UNIT.get(new_sm_label, "Val"),
-            value=leg.get("strike_val", "0.30"),
-            key="leg_sv_" + str(lid),
-        )
-        leg["dte"] = c6.text_input(
-            "DTE", value=leg.get("dte", "0"),
-            key="leg_dte_" + str(lid),
-        )
-        leg["exact_dte"] = c6.checkbox(
-            "Exact DTE", value=leg.get("exact_dte", False),
-            key="leg_xdte_" + str(lid),
-        )
-        leg["lock"] = c7.checkbox(
-            "Lock Strike", value=leg.get("lock", False),
-            key="leg_lock_" + str(lid),
-        )
-
-        st.caption(STRIKE_CAPTIONS[new_sm_label])
-
+            key="leg_right_" + str(lid))
+        leg["quantity"] = c3.text_input("Qty", value=leg.get("quantity", "1"),
+            key="leg_qty_" + str(lid))
+        if is_child:
+            cm_display = next(
+                (k for k, v in CHILD_STRIKE_METHOD_KEY.items() if v == leg.get("child_method", "width")),
+                "Width (pts)")
+            new_cm_label = c4.selectbox("Child Strike Mode", CHILD_STRIKE_METHODS,
+                index=CHILD_STRIKE_METHODS.index(cm_display),
+                key="leg_csm_" + str(lid))
+            if CHILD_STRIKE_METHOD_KEY[new_cm_label] != leg["child_method"]:
+                leg["child_method"] = CHILD_STRIKE_METHOD_KEY[new_cm_label]
+                leg["strike_val"] = "0"; leg["max_width"] = "0"
+            cm_key = leg["child_method"]
+            if cm_key == "width":
+                leg["strike_val"] = c5.text_input("Width (±pts)",
+                    value=leg.get("strike_val", "0"), key="leg_sv_" + str(lid))
+                leg["max_width"] = "0"
+            else:
+                unit_lbl = "Δ" if cm_key == "delta_maxwidth" else "$"
+                sv_c, mw_c = c5.columns(2)
+                leg["strike_val"] = sv_c.text_input(unit_lbl,
+                    value=leg.get("strike_val", "0.20"), key="leg_sv_" + str(lid))
+                leg["max_width"]  = mw_c.text_input("Max W",
+                    value=leg.get("max_width", "0"), key="leg_mw_" + str(lid))
+            st.caption(CHILD_STRIKE_CAPTIONS[new_cm_label])
+        else:
+            sm_display = next(
+                (k for k, v in STRIKE_METHOD_KEY.items() if v == leg.get("strike_method", "delta")), "Delta")
+            new_sm_label = c4.selectbox("Strike Method", STRIKE_METHODS,
+                index=STRIKE_METHODS.index(sm_display), key="leg_sm_" + str(lid))
+            if STRIKE_METHOD_KEY[new_sm_label] != leg["strike_method"]:
+                leg["strike_method"] = STRIKE_METHOD_KEY[new_sm_label]
+                leg["strike_val"] = str(STRIKE_DEFAULTS[new_sm_label])
+            leg["strike_val"] = c5.text_input(STRIKE_UNIT.get(new_sm_label, "Val"),
+                value=leg.get("strike_val", "0.30"), key="leg_sv_" + str(lid))
+            st.caption(STRIKE_CAPTIONS[new_sm_label])
+        leg["dte"] = c6.text_input("DTE", value=leg.get("dte", "0"), key="leg_dte_" + str(lid))
+        leg["exact_dte"] = c6.checkbox("Exact DTE", value=leg.get("exact_dte", False),
+            key="leg_xdte_" + str(lid))
+        if is_child:
+            lock_val  = leg.get("lock", True)
+            lock_icon = "🔒" if lock_val else "🔓"
+            if c7.button(lock_icon, key="leg_lock_btn_" + str(lid),
+                         help="Lock ON: exact strike required. Lock OFF: nearest strike used."):
+                leg["lock"] = not lock_val
+                st.rerun()
+        else:
+            leg["lock"] = False
+        if not is_child:
+            rs_col, _ = st.columns([1, 3])
+            leg["round_strikes"] = rs_col.text_input(
+                "Round strikes to nearest (blank = off, e.g. 5 for SPX)",
+                value=leg.get("round_strikes", ""), placeholder="e.g. 5 for SPX",
+                key="leg_rs_" + str(lid))
         btn_cols = st.columns([1, 1, 4])
         if not is_child and has_room:
-            if btn_cols[0].button("+ Child Leg", key="add_child_" + str(lid)):
-                add_child_leg(lid)
-                st.rerun()
-        if btn_cols[1].button("Delete", key="del_leg_" + str(lid)):
-            delete_leg(lid)
-            st.rerun()
-
+            if btn_cols[0].button("🔗 Link Leg", key="add_child_" + str(lid)):
+                add_child_leg(lid); st.rerun()
+        if btn_cols[1].button("✕ Delete", key="del_leg_" + str(lid)):
+            delete_leg(lid); st.rerun()
     for child in children:
         render_leg(child, is_child=True)
 
@@ -306,6 +345,11 @@ def build_config_from_params(p: dict):
             direction = p.get("vix_on_dir", "both"),
             unit      = p.get("vix_on_unit", UNIT_PCT),
             threshold = safe_float(p.get("vix_on_thresh", 0), 0.0),
+        
+            min_up = safe_float(p.get("vix_on_min_up", 0.0), 0.0),
+            max_up = safe_float(p.get("vix_on_max_up", 999.0), 999.0),
+            min_dn = safe_float(p.get("vix_on_min_dn", 0.0), 0.0),
+            max_dn = safe_float(p.get("vix_on_max_dn", 999.0), 999.0),
         ),
         intraday=VixIntradayFilter(
             enabled   = bool(p.get("vix_id_enabled", False)),
@@ -313,6 +357,11 @@ def build_config_from_params(p: dict):
             unit      = p.get("vix_id_unit", UNIT_PCT),
             min_move  = safe_float(p.get("vix_id_min", 0), 0.0),
             max_move  = safe_float(p.get("vix_id_max", 999), 999.0),
+        
+            min_up = safe_float(p.get("vix_id_min_up", 0.0), 0.0),
+            max_up = safe_float(p.get("vix_id_max_up", 999.0), 999.0),
+            min_dn = safe_float(p.get("vix_id_min_dn", 0.0), 0.0),
+            max_dn = safe_float(p.get("vix_id_max_dn", 999.0), 999.0),
         ),
         vix9d=Vix9dRatioFilter(
             enabled         = bool(p.get("vix9d_enabled", False)),
@@ -330,6 +379,11 @@ def build_config_from_params(p: dict):
         unit      = p.get("gap_unit", UNIT_PCT),
         min_gap   = safe_float(p.get("gap_min", 0), 0.0),
         max_gap   = safe_float(p.get("gap_max", 999), 999.0),
+    
+        min_up = safe_float(p.get("gap_min_up", 0.0), 0.0),
+        max_up = safe_float(p.get("gap_max_up", 999.0), 999.0),
+        min_dn = safe_float(p.get("gap_min_dn", 0.0), 0.0),
+        max_dn = safe_float(p.get("gap_max_dn", 999.0), 999.0),
     )
     intraday_move = IntradayMoveFilter(
         enabled   = bool(p.get("id_enabled", False)),
@@ -337,6 +391,11 @@ def build_config_from_params(p: dict):
         unit      = p.get("id_unit", UNIT_PCT),
         min_move  = safe_float(p.get("id_min", 0), 0.0),
         max_move  = safe_float(p.get("id_max", 999), 999.0),
+    
+        min_up = safe_float(p.get("id_min_up", 0.0), 0.0),
+        max_up = safe_float(p.get("id_max_up", 999.0), 999.0),
+        min_dn = safe_float(p.get("id_min_dn", 0.0), 0.0),
+        max_dn = safe_float(p.get("id_max_dn", 999.0), 999.0),
     )
     technicals = TechnicalFilters(
         rsi=RsiFilter(
@@ -351,9 +410,12 @@ def build_config_from_params(p: dict):
             condition = p.get("sma_cond", "above"),
         ),
         ema=EmaFilter(
-            enabled   = bool(p.get("ema_enabled", False)),
-            period    = safe_int(p.get("ema_period", 9), 9),
-            condition = p.get("ema_cond", "above"),
+            enabled     = bool(p.get("ema_enabled", False)),
+            mode        = p.get("ema_mode", "price > EMA"),
+            period      = safe_int(p.get("ema_period", 9), 9),
+            period2     = safe_int(p.get("ema_period2", 21), 21),
+            compare_op  = p.get("ema_compare_op", ">"),
+            condition   = p.get("ema_cond", "above"),
         ),
     )
 
@@ -604,194 +666,267 @@ with tabs[0]:
         # ── VIX Filters ───────────────────────────────────────────────────────
         with st.expander("VIX Filters", expanded=False):
 
-            # VIX Range
-            st.markdown('<div class="section-hdr">VIX Range</div>', unsafe_allow_html=True)
-            vix_range_enabled = st.checkbox("Enable VIX Range Filter",
-                value=bool(loaded.get("vix_range_enabled", False)) if loaded else False,
-                key="vix_range_enabled")
-            if vix_range_enabled:
-                rc1, rc2 = st.columns(2)
-                vix_min = rc1.number_input("Min VIX", min_value=0.0, max_value=500.0,
+            use_vix = st.toggle("Use VIX",
+                value=bool(loaded.get("vix_range_enabled") or loaded.get("vix_on_enabled") or
+                           loaded.get("vix_id_enabled") or loaded.get("vix9d_enabled")) if loaded else False,
+                key="use_vix_master")
+
+            if use_vix:
+                st.markdown('<div class="section-hdr">VIX Level</div>', unsafe_allow_html=True)
+                vix_range_enabled = st.checkbox("Enable VIX Level Filter",
+                    value=bool(loaded.get("vix_range_enabled", False)) if loaded else False,
+                    key="vix_range_enabled")
+                vr1, vr2 = st.columns(2)
+                vix_min = vr1.number_input("Min VIX", min_value=0.0, max_value=9999.0,
                     value=safe_float(loaded.get("vix_min", 0.0) if loaded else 0.0, 0.0),
-                    step=0.5, format="%.1f", key="vix_min_input")
-                vix_max = rc2.number_input("Max VIX", min_value=0.0, max_value=500.0,
+                    step=0.5, format="%.1f", key="vix_min_input", disabled=not vix_range_enabled)
+                vix_max = vr2.number_input("Max VIX", min_value=0.0,
                     value=safe_float(loaded.get("vix_max", 999.0) if loaded else 999.0, 999.0),
-                    step=0.5, format="%.1f", key="vix_max_input")
-                st.caption("Entry allowed when VIX is between " + str(vix_min) + " and " + str(vix_max) + ".")
-            else:
-                vix_min, vix_max = 0.0, 999.0
+                    step=0.5, format="%.1f", key="vix_max_input", disabled=not vix_range_enabled)
+                if not vix_range_enabled:
+                    vix_min, vix_max = 0.0, 999.0
+                st.divider()
 
-            st.divider()
+                st.markdown('<div class="section-hdr">VIX Overnight Move</div>', unsafe_allow_html=True)
+                st.caption("Overnight = 4:15 PM VIX (prior day) vs. VIX at market open (~9:30). If VIX has not printed, last pre-market print (~9:25) is used.")
+                vix_on_enabled = st.checkbox("Enable VIX Overnight Move Filter",
+                    value=bool(loaded.get("vix_on_enabled", False)) if loaded else False,
+                    key="vix_on_enabled")
+                vix_on_unit = st.radio("Overnight Unit", [UNIT_PCT, UNIT_POINTS],
+                    format_func=lambda x: "%" if x == UNIT_PCT else "Points",
+                    index=0 if not loaded or loaded.get("vix_on_unit", UNIT_PCT) == UNIT_PCT else 1,
+                    horizontal=True, key="vix_on_unit", disabled=not vix_on_enabled)
+                on1, on2, on3, on4 = st.columns(4)
+                vix_on_min_up = on1.number_input("Min VIX Overnight Move Up", min_value=0.0,
+                    value=safe_float(loaded.get("vix_on_min_up", 0.0) if loaded else 0.0, 0.0),
+                    step=0.1, format="%.2f", key="vix_on_min_up", disabled=not vix_on_enabled)
+                vix_on_max_up = on2.number_input("Max VIX Overnight Move Up", min_value=0.0,
+                    value=safe_float(loaded.get("vix_on_max_up", 999.0) if loaded else 999.0, 999.0),
+                    step=0.1, format="%.2f", key="vix_on_max_up", disabled=not vix_on_enabled)
+                vix_on_min_dn = on3.number_input("Min VIX Overnight Move Down", min_value=0.0,
+                    value=safe_float(loaded.get("vix_on_min_dn", 0.0) if loaded else 0.0, 0.0),
+                    step=0.1, format="%.2f", key="vix_on_min_dn", disabled=not vix_on_enabled)
+                vix_on_max_dn = on4.number_input("Max VIX Overnight Move Down", min_value=0.0,
+                    value=safe_float(loaded.get("vix_on_max_dn", 999.0) if loaded else 999.0, 999.0),
+                    step=0.1, format="%.2f", key="vix_on_max_dn", disabled=not vix_on_enabled)
+                if not vix_on_enabled:
+                    vix_on_min_up = vix_on_max_up = vix_on_min_dn = vix_on_max_dn = 0.0
+                vix_on_dir, vix_on_thresh = "both", 0.0
+                st.divider()
 
-            # VIX Overnight
-            st.markdown('<div class="section-hdr">VIX Overnight Move</div>', unsafe_allow_html=True)
-            vix_on_enabled = st.checkbox("Enable VIX Overnight Filter",
-                value=bool(loaded.get("vix_on_enabled", False)) if loaded else False,
-                key="vix_on_enabled")
-            if vix_on_enabled:
-                oc1, oc2, oc3, oc4 = st.columns(4)
-                vix_on_dir = oc1.selectbox("Direction", ["up", "down", "both"],
-                    index=["up", "down", "both"].index(loaded.get("vix_on_dir", "both") if loaded else "both"),
-                    key="vix_on_dir")
-                vix_on_unit = oc2.selectbox("Unit", [UNIT_PCT, UNIT_POINTS],
-                    index=0 if not loaded or loaded.get("vix_on_unit") == UNIT_PCT else 1,
-                    key="vix_on_unit")
-                vix_on_thresh = oc3.number_input("Min Move Threshold", min_value=0.0,
-                    value=safe_float(loaded.get("vix_on_thresh", 0.0) if loaded else 0.0, 0.0),
-                    step=0.1, format="%.2f", key="vix_on_thresh")
-                unit_lbl = "%" if vix_on_unit == UNIT_PCT else " pts"
-                oc4.caption("Compares last pre-market VIX snap (before 09:25) to current VIX. Requires |move| >= " + str(vix_on_thresh) + unit_lbl + ", direction = " + vix_on_dir + ".")
-            else:
-                vix_on_dir, vix_on_unit, vix_on_thresh = "both", UNIT_PCT, 0.0
+                st.markdown('<div class="section-hdr">VIX Intraday Move</div>', unsafe_allow_html=True)
+                st.caption("Intraday = RTH open VIX (~9:30) vs. current 1-min bar open.")
+                vix_id_enabled = st.checkbox("Enable VIX Intraday Move Filter",
+                    value=bool(loaded.get("vix_id_enabled", False)) if loaded else False,
+                    key="vix_id_enabled")
+                vix_id_unit = st.radio("Intraday Unit", [UNIT_PCT, UNIT_POINTS],
+                    format_func=lambda x: "%" if x == UNIT_PCT else "Points",
+                    index=0 if not loaded or loaded.get("vix_id_unit", UNIT_PCT) == UNIT_PCT else 1,
+                    horizontal=True, key="vix_id_unit", disabled=not vix_id_enabled)
+                id1, id2, id3, id4 = st.columns(4)
+                vix_id_min_up = id1.number_input("Min VIX Intraday Move Up", min_value=0.0,
+                    value=safe_float(loaded.get("vix_id_min_up", 0.0) if loaded else 0.0, 0.0),
+                    step=0.1, format="%.2f", key="vix_id_min_up", disabled=not vix_id_enabled)
+                vix_id_max_up = id2.number_input("Max VIX Intraday Move Up", min_value=0.0,
+                    value=safe_float(loaded.get("vix_id_max_up", 999.0) if loaded else 999.0, 999.0),
+                    step=0.1, format="%.2f", key="vix_id_max_up", disabled=not vix_id_enabled)
+                vix_id_min_dn = id3.number_input("Min VIX Intraday Move Down", min_value=0.0,
+                    value=safe_float(loaded.get("vix_id_min_dn", 0.0) if loaded else 0.0, 0.0),
+                    step=0.1, format="%.2f", key="vix_id_min_dn", disabled=not vix_id_enabled)
+                vix_id_max_dn = id4.number_input("Max VIX Intraday Move Down", min_value=0.0,
+                    value=safe_float(loaded.get("vix_id_max_dn", 999.0) if loaded else 999.0, 999.0),
+                    step=0.1, format="%.2f", key="vix_id_max_dn", disabled=not vix_id_enabled)
+                if not vix_id_enabled:
+                    vix_id_min_up = vix_id_max_up = vix_id_min_dn = vix_id_max_dn = 0.0
+                vix_id_dir, vix_id_min, vix_id_max = "both", 0.0, 999.0
+                st.divider()
 
-            st.divider()
-
-            # VIX Intraday
-            st.markdown('<div class="section-hdr">VIX Intraday Move</div>', unsafe_allow_html=True)
-            vix_id_enabled = st.checkbox("Enable VIX Intraday Filter",
-                value=bool(loaded.get("vix_id_enabled", False)) if loaded else False,
-                key="vix_id_enabled")
-            if vix_id_enabled:
-                ic1, ic2, ic3, ic4, ic5 = st.columns(5)
-                vix_id_dir = ic1.selectbox("Direction", ["up", "down", "both"],
-                    index=["up", "down", "both"].index(loaded.get("vix_id_dir", "both") if loaded else "both"),
-                    key="vix_id_dir")
-                vix_id_unit = ic2.selectbox("Unit", [UNIT_PCT, UNIT_POINTS],
-                    index=0 if not loaded or loaded.get("vix_id_unit") == UNIT_PCT else 1,
-                    key="vix_id_unit")
-                vix_id_min = ic3.number_input("Min Move", min_value=0.0,
-                    value=safe_float(loaded.get("vix_id_min", 0.0) if loaded else 0.0, 0.0),
-                    step=0.1, format="%.2f", key="vix_id_min")
-                vix_id_max = ic4.number_input("Max Move", min_value=0.0,
-                    value=safe_float(loaded.get("vix_id_max", 999.0) if loaded else 999.0, 999.0),
-                    step=0.5, format="%.2f", key="vix_id_max")
-                id_unit_lbl = "%" if vix_id_unit == UNIT_PCT else " pts"
-                ic5.caption("VIX RTH open (09:25 print) to current 1-min bar open. Range [" + str(vix_id_min) + ", " + str(vix_id_max) + "]" + id_unit_lbl + " dir=" + vix_id_dir + ".")
-            else:
-                vix_id_dir, vix_id_unit = "both", UNIT_PCT
-                vix_id_min, vix_id_max  = 0.0, 999.0
-
-            st.divider()
-
-            # VIX9D / VIX Ratio
-            st.markdown('<div class="section-hdr">VIX9D / VIX Ratio</div>', unsafe_allow_html=True)
-            vix9d_enabled = st.checkbox("Enable VIX9D / VIX Ratio Filter",
-                value=bool(loaded.get("vix9d_enabled", False)) if loaded else False,
-                key="vix9d_enabled")
-            if vix9d_enabled:
-                r1, r2 = st.columns(2)
-                vix9d_entry_min = r1.number_input("Entry Min Ratio", min_value=0.0,
+                st.markdown('<div class="section-hdr">VIX9D / VIX Ratio</div>', unsafe_allow_html=True)
+                st.caption("Ratio = VIX9D / VIX at the open of the current 1-min bar. If VIX9D has not printed at entry, entry is blocked. As an exit condition, missing VIX9D is non-blocking.")
+                vix9d_enabled = st.checkbox("Enable VIX9D / VIX Ratio Filter",
+                    value=bool(loaded.get("vix9d_enabled", False)) if loaded else False,
+                    key="vix9d_enabled")
+                rx1, rx2 = st.columns(2)
+                vix9d_entry_min = rx1.number_input("Min VIX9D / VIX Ratio", min_value=0.0,
                     value=safe_float(loaded.get("vix9d_entry_min", 0.0) if loaded else 0.0, 0.0),
-                    step=0.01, format="%.3f", key="vix9d_entry_min")
-                vix9d_entry_max = r2.number_input("Entry Max Ratio", min_value=0.0,
+                    step=0.01, format="%.3f", key="vix9d_entry_min", disabled=not vix9d_enabled)
+                vix9d_entry_max = rx2.number_input("Max VIX9D / VIX Ratio", min_value=0.0,
                     value=safe_float(loaded.get("vix9d_entry_max", 999.0) if loaded else 999.0, 999.0),
-                    step=0.01, format="%.3f", key="vix9d_entry_max")
-                st.caption("If VIX9D has not printed by entry time, entry is BLOCKED. Ratio = VIX9D / VIX using open of current 1-min bar.")
-
-                vix9d_use_exit = st.checkbox(
-                    "Use a separate VIX9D/VIX exit condition",
+                    step=0.01, format="%.3f", key="vix9d_entry_max", disabled=not vix9d_enabled)
+                if not vix9d_enabled:
+                    vix9d_entry_min, vix9d_entry_max = 0.0, 999.0
+                vix9d_use_exit = st.checkbox("Use separate VIX9D / VIX exit condition",
                     value=bool(loaded.get("vix9d_use_exit", False)) if loaded else False,
-                    key="vix9d_use_exit")
-                if vix9d_use_exit:
+                    key="vix9d_use_exit", disabled=not vix9d_enabled)
+                if vix9d_enabled and vix9d_use_exit:
                     ex1, ex2 = st.columns(2)
-                    vix9d_exit_min = ex1.number_input("Exit Min Ratio", min_value=0.0,
+                    vix9d_exit_min = ex1.number_input("Min VIX9D / VIX Ratio (Exit)", min_value=0.0,
                         value=safe_float(loaded.get("vix9d_exit_min", 0.0) if loaded else 0.0, 0.0),
                         step=0.01, format="%.3f", key="vix9d_exit_min")
-                    vix9d_exit_max = ex2.number_input("Exit Max Ratio", min_value=0.0,
+                    vix9d_exit_max = ex2.number_input("Max VIX9D / VIX Ratio (Exit)", min_value=0.0,
                         value=safe_float(loaded.get("vix9d_exit_max", 999.0) if loaded else 999.0, 999.0),
                         step=0.01, format="%.3f", key="vix9d_exit_max")
-                    st.caption("If VIX9D has not printed, the exit condition is skipped (non-blocking).")
+                    st.caption("If VIX9D has not printed, this exit condition is skipped (non-blocking).")
                 else:
                     vix9d_exit_min, vix9d_exit_max = 0.0, 999.0
+
             else:
+                vix_range_enabled = False
+                vix_min, vix_max   = 0.0, 999.0
+                vix_on_enabled     = False; vix_on_unit = UNIT_PCT
+                vix_on_dir         = "both"; vix_on_thresh = 0.0
+                vix_on_min_up = vix_on_max_up = vix_on_min_dn = vix_on_max_dn = 0.0
+                vix_id_enabled     = False; vix_id_unit = UNIT_PCT
+                vix_id_dir         = "both"; vix_id_min = 0.0; vix_id_max = 999.0
+                vix_id_min_up = vix_id_max_up = vix_id_min_dn = vix_id_max_dn = 0.0
+                vix9d_enabled = False
                 vix9d_entry_min, vix9d_entry_max = 0.0, 999.0
-                vix9d_use_exit                   = False
+                vix9d_use_exit = False
                 vix9d_exit_min, vix9d_exit_max   = 0.0, 999.0
 
-        # ── Underlying Filters ─────────────────────────────────────────────────
+        # ── Underlying Filters ─────────────────────────────────────────────────────────────────
+
         with st.expander("Underlying Filters", expanded=False):
 
-            # Gap
             st.markdown('<div class="section-hdr">Overnight Gap</div>', unsafe_allow_html=True)
+            st.caption("Prev close to RTH open. Up = positive gap, Down = negative gap (enter absolute values).")
             gap_enabled = st.checkbox("Enable Gap Filter",
                 value=bool(loaded.get("gap_enabled", False)) if loaded else False,
                 key="gap_enabled")
-            if gap_enabled:
-                g1, g2, g3, g4, g5 = st.columns(5)
-                gap_dir  = g1.selectbox("Direction", ["up", "down", "both"], key="gap_dir")
-                gap_unit = g2.selectbox("Unit", [UNIT_PCT, UNIT_POINTS], key="gap_unit")
-                gap_min  = g3.number_input("Min Gap", min_value=0.0, step=0.1, format="%.2f", key="gap_min")
-                gap_max  = g4.number_input("Max Gap", min_value=0.0, value=999.0, step=0.5, format="%.2f", key="gap_max")
-                g5.caption("Prev close to RTH open. Direction controls sign.")
-            else:
-                gap_dir, gap_unit = "both", UNIT_PCT
-                gap_min, gap_max  = 0.0, 999.0
-
+            gap_unit = st.radio("Gap Unit", [UNIT_PCT, UNIT_POINTS],
+                format_func=lambda x: "%" if x == UNIT_PCT else "Points",
+                index=0 if not loaded or loaded.get("gap_unit", UNIT_PCT) == UNIT_PCT else 1,
+                horizontal=True, key="gap_unit", disabled=not gap_enabled)
+            gp1, gp2, gp3, gp4 = st.columns(4)
+            gap_min_up = gp1.number_input("Min Gap Up", min_value=0.0,
+                value=safe_float(loaded.get("gap_min_up", 0.0) if loaded else 0.0, 0.0),
+                step=0.1, format="%.2f", key="gap_min_up", disabled=not gap_enabled)
+            gap_max_up = gp2.number_input("Max Gap Up", min_value=0.0,
+                value=safe_float(loaded.get("gap_max_up", 999.0) if loaded else 999.0, 999.0),
+                step=0.1, format="%.2f", key="gap_max_up", disabled=not gap_enabled)
+            gap_min_dn = gp3.number_input("Min Gap Down", min_value=0.0,
+                value=safe_float(loaded.get("gap_min_dn", 0.0) if loaded else 0.0, 0.0),
+                step=0.1, format="%.2f", key="gap_min_dn", disabled=not gap_enabled)
+            gap_max_dn = gp4.number_input("Max Gap Down", min_value=0.0,
+                value=safe_float(loaded.get("gap_max_dn", 999.0) if loaded else 999.0, 999.0),
+                step=0.1, format="%.2f", key="gap_max_dn", disabled=not gap_enabled)
+            if not gap_enabled:
+                gap_min_up = gap_max_up = gap_min_dn = gap_max_dn = 0.0
+            gap_dir, gap_min, gap_max = "both", 0.0, 999.0
             st.divider()
 
-            # Intraday Move
             st.markdown('<div class="section-hdr">Intraday Move</div>', unsafe_allow_html=True)
+            st.caption("Daily open (1-min candle open) to current price. Updated every minute.")
             id_enabled = st.checkbox("Enable Intraday Move Filter",
                 value=bool(loaded.get("id_enabled", False)) if loaded else False,
                 key="id_enabled")
-            if id_enabled:
-                im1, im2, im3, im4, im5 = st.columns(5)
-                id_dir  = im1.selectbox("Direction", ["up", "down", "both"], key="id_dir")
-                id_unit = im2.selectbox("Unit", [UNIT_PCT, UNIT_POINTS], key="id_unit")
-                id_min  = im3.number_input("Min Move", min_value=0.0, step=0.1, format="%.2f", key="id_min")
-                id_max  = im4.number_input("Max Move", min_value=0.0, value=999.0, step=0.5, format="%.2f", key="id_max")
-                im5.caption("Daily open (1-min candle open) to current price. Updated every minute.")
-            else:
-                id_dir, id_unit = "both", UNIT_PCT
-                id_min, id_max  = 0.0, 999.0
-
+            id_unit = st.radio("Intraday Move Unit", [UNIT_PCT, UNIT_POINTS],
+                format_func=lambda x: "%" if x == UNIT_PCT else "Points",
+                index=0 if not loaded or loaded.get("id_unit", UNIT_PCT) == UNIT_PCT else 1,
+                horizontal=True, key="id_unit", disabled=not id_enabled)
+            im1, im2, im3, im4 = st.columns(4)
+            id_min_up = im1.number_input("Min Move Up", min_value=0.0,
+                value=safe_float(loaded.get("id_min_up", 0.0) if loaded else 0.0, 0.0),
+                step=0.1, format="%.2f", key="id_min_up", disabled=not id_enabled)
+            id_max_up = im2.number_input("Max Move Up", min_value=0.0,
+                value=safe_float(loaded.get("id_max_up", 999.0) if loaded else 999.0, 999.0),
+                step=0.1, format="%.2f", key="id_max_up", disabled=not id_enabled)
+            id_min_dn = im3.number_input("Min Move Down", min_value=0.0,
+                value=safe_float(loaded.get("id_min_dn", 0.0) if loaded else 0.0, 0.0),
+                step=0.1, format="%.2f", key="id_min_dn", disabled=not id_enabled)
+            id_max_dn = im4.number_input("Max Move Down", min_value=0.0,
+                value=safe_float(loaded.get("id_max_dn", 999.0) if loaded else 999.0, 999.0),
+                step=0.1, format="%.2f", key="id_max_dn", disabled=not id_enabled)
+            if not id_enabled:
+                id_min_up = id_max_up = id_min_dn = id_max_dn = 0.0
+            id_dir, id_min, id_max = "both", 0.0, 999.0
             st.divider()
 
-            # RSI
             st.markdown('<div class="section-hdr">RSI</div>', unsafe_allow_html=True)
             rsi_enabled = st.checkbox("Enable RSI Filter",
-                value=bool(loaded.get("rsi_enabled", False)) if loaded else False,
-                key="rsi_enabled")
+                value=bool(loaded.get("rsi_enabled", False)) if loaded else False, key="rsi_enabled")
             if rsi_enabled:
                 ri1, ri2, ri3, ri4 = st.columns(4)
-                rsi_period = safe_int(ri1.number_input("Period", min_value=2, max_value=100, value=14, key="rsi_period"), 14)
-                rsi_min    = ri2.number_input("Min RSI", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key="rsi_min")
-                rsi_max    = ri3.number_input("Max RSI", min_value=0.0, max_value=100.0, value=100.0, step=1.0, key="rsi_max")
-                ri4.caption("Wilder RSI-14. Updated per minute using last (N-1) daily closes + current intraday price.")
+                rsi_period = safe_int(ri1.number_input("Period", min_value=2, max_value=100,
+                    value=safe_int(loaded.get("rsi_period", 14) if loaded else 14, 14), key="rsi_period"), 14)
+                rsi_min = ri2.number_input("Min RSI", min_value=0.0, max_value=100.0,
+                    value=safe_float(loaded.get("rsi_min", 0.0) if loaded else 0.0, 0.0),
+                    step=1.0, key="rsi_min")
+                rsi_max = ri3.number_input("Max RSI", min_value=0.0, max_value=100.0,
+                    value=safe_float(loaded.get("rsi_max", 100.0) if loaded else 100.0, 100.0),
+                    step=1.0, key="rsi_max")
+                ri4.caption("Wilder RSI. Updated per minute using last (N-1) daily closes + current intraday price.")
             else:
                 rsi_period, rsi_min, rsi_max = 14, 0.0, 100.0
-
             st.divider()
 
-            # SMA
             st.markdown('<div class="section-hdr">SMA</div>', unsafe_allow_html=True)
             sma_enabled = st.checkbox("Enable SMA Filter",
-                value=bool(loaded.get("sma_enabled", False)) if loaded else False,
-                key="sma_enabled")
+                value=bool(loaded.get("sma_enabled", False)) if loaded else False, key="sma_enabled")
             if sma_enabled:
                 sm1, sm2, sm3 = st.columns(3)
-                sma_period = safe_int(sm1.number_input("SMA Period", min_value=2, max_value=500, value=20, key="sma_period"), 20)
-                sma_cond   = sm2.selectbox("Price must be", ["above", "below"], key="sma_cond")
+                sma_period = safe_int(sm1.number_input("SMA Period", min_value=2, max_value=500,
+                    value=safe_int(loaded.get("sma_period", 20) if loaded else 20, 20), key="sma_period"), 20)
+                sma_cond = sm2.selectbox("Price must be", ["above", "below"],
+                    index=["above","below"].index(loaded.get("sma_cond","above") if loaded else "above"),
+                    key="sma_cond")
                 sm3.caption("Daily resolution: last (N-1) closes + current intraday price.")
             else:
                 sma_period, sma_cond = 20, "above"
-
             st.divider()
 
-            # EMA
             st.markdown('<div class="section-hdr">EMA</div>', unsafe_allow_html=True)
+            st.caption(
+                "Calculated on **1-minute bars**. "
+                "SPX uses post-close settlement candles; SPY/QQQ/IWM/etc. use pre- & post-market data. "
+                "TradingView match: ticker → Settings → Symbol → Session → Extended Trading Hours."
+            )
             ema_enabled = st.checkbox("Enable EMA Filter",
                 value=bool(loaded.get("ema_enabled", False)) if loaded else False,
                 key="ema_enabled")
             if ema_enabled:
-                em1, em2, em3 = st.columns(3)
-                ema_period = safe_int(em1.number_input("EMA Period", min_value=2, max_value=200, value=9, key="ema_period"), 9)
-                ema_cond   = em2.selectbox("Price must be", ["above", "below"], key="ema_cond")
-                em3.caption("Intraday 1-minute bars (full deque including extended hours).")
+                EMA_MODES = ["price > EMA", "price < EMA", "EMA(s) compare"]
+                ema_mode = st.selectbox(
+                    "EMA Entry",
+                    EMA_MODES,
+                    index=EMA_MODES.index(loaded.get("ema_mode", "price > EMA")) if loaded and loaded.get("ema_mode") in EMA_MODES else 0,
+                    key="ema_mode",
+                    help="'price > EMA': enter only when price is above EMA.\n'price < EMA': enter only when price is below EMA.\n'EMA(s) compare': enter when EMA(period1) is above or below EMA(period2)."
+                )
+                if ema_mode in ("price > EMA", "price < EMA"):
+                    ema_period = safe_int(st.number_input(
+                        "EMA Period (minutes)",
+                        min_value=2, max_value=500,
+                        value=safe_int(loaded.get("ema_period", 9) if loaded else 9, 9),
+                        help="Number of 1-minute bars for the EMA.",
+                        key="ema_period"), 9)
+                    ema_cond        = "above" if ema_mode == "price > EMA" else "below"
+                    ema_period2     = 0
+                    ema_compare_op  = ">"
+                else:
+                    # EMA(s) compare mode: EMA(period1) > or < EMA(period2)
+                    cmp1, cmp2, cmp3 = st.columns([2, 0.6, 2])
+                    ema_period = safe_int(cmp1.number_input(
+                        "EMA Period 1 (minutes)",
+                        min_value=2, max_value=500,
+                        value=safe_int(loaded.get("ema_period", 9) if loaded else 9, 9),
+                        key="ema_period"), 9)
+                    ema_compare_op = cmp2.selectbox(
+                        " ",
+                        [">", "<"],
+                        index=0 if not loaded or loaded.get("ema_compare_op", ">") == ">" else 1,
+                        key="ema_compare_op",
+                        label_visibility="hidden")
+                    ema_period2 = safe_int(cmp3.number_input(
+                        "EMA Period 2 (minutes)",
+                        min_value=2, max_value=500,
+                        value=safe_int(loaded.get("ema_period2", 21) if loaded else 21, 21),
+                        key="ema_period2"), 21)
+                    ema_cond = "compare"
+                    st.caption(f"Entry triggers when EMA({ema_period}) {ema_compare_op} EMA({ema_period2}).")
             else:
-                ema_period, ema_cond = 9, "above"
+                ema_period, ema_period2, ema_cond, ema_mode, ema_compare_op = 9, 21, "above", "price > EMA", ">"
 
-        # ── Execution ──────────────────────────────────────────────────────────
         with st.expander("Execution", expanded=False):
 
             st.markdown('<div class="section-hdr">Entry Execution</div>', unsafe_allow_html=True)
@@ -921,11 +1056,19 @@ with tabs[0]:
                 "vix_on_dir":         vix_on_dir,
                 "vix_on_unit":        vix_on_unit,
                 "vix_on_thresh":      vix_on_thresh,
+                "vix_on_min_up":      vix_on_min_up,
+                "vix_on_max_up":      vix_on_max_up,
+                "vix_on_min_dn":      vix_on_min_dn,
+                "vix_on_max_dn":      vix_on_max_dn,
                 "vix_id_enabled":     vix_id_enabled,
                 "vix_id_dir":         vix_id_dir,
                 "vix_id_unit":        vix_id_unit,
                 "vix_id_min":         vix_id_min,
                 "vix_id_max":         vix_id_max,
+                "vix_id_min_up":      vix_id_min_up,
+                "vix_id_max_up":      vix_id_max_up,
+                "vix_id_min_dn":      vix_id_min_dn,
+                "vix_id_max_dn":      vix_id_max_dn,
                 "vix9d_enabled":      vix9d_enabled,
                 "vix9d_entry_min":    vix9d_entry_min,
                 "vix9d_entry_max":    vix9d_entry_max,
@@ -938,11 +1081,19 @@ with tabs[0]:
                 "gap_unit":           gap_unit,
                 "gap_min":            gap_min,
                 "gap_max":            gap_max,
+                "gap_min_up":         gap_min_up,
+                "gap_max_up":         gap_max_up,
+                "gap_min_dn":         gap_min_dn,
+                "gap_max_dn":         gap_max_dn,
                 "id_enabled":         id_enabled,
                 "id_dir":             id_dir,
                 "id_unit":            id_unit,
                 "id_min":             id_min,
                 "id_max":             id_max,
+                "id_min_up":          id_min_up,
+                "id_max_up":          id_max_up,
+                "id_min_dn":          id_min_dn,
+                "id_max_dn":          id_max_dn,
                 "rsi_enabled":        rsi_enabled,
                 "rsi_period":         rsi_period,
                 "rsi_min":            rsi_min,
@@ -951,7 +1102,10 @@ with tabs[0]:
                 "sma_period":         sma_period,
                 "sma_cond":           sma_cond,
                 "ema_enabled":        ema_enabled,
+                "ema_mode":           ema_mode,
                 "ema_period":         ema_period,
+                "ema_period2":        ema_period2,
+                "ema_compare_op":     ema_compare_op,
                 "ema_cond":           ema_cond,
                 # Execution
                 "entry_max_att":      entry_max_att,
